@@ -39,6 +39,62 @@ describe("plugin-elizacloud persistConfigEnv", () => {
   );
 
   it(
+    "reads an export prefix and inline comments as the secret only",
+    async () => {
+      const exported = "ELIZA_TEST_CONFIG_ENV_EXPORT";
+      const quoted = "ELIZA_TEST_CONFIG_ENV_QUOTED";
+      const plain = "ELIZA_TEST_CONFIG_ENV_PLAIN";
+      const quotedHash = "ELIZA_TEST_CONFIG_ENV_HASH";
+      const bareHash = "ELIZA_TEST_CONFIG_ENV_BAREHASH";
+      const single = "ELIZA_TEST_CONFIG_ENV_SINGLE";
+      await fs.writeFile(
+        path.join(root, "config.env"),
+        [
+          `# preserved comment`,
+          `export ${exported}="from-export" # note`,
+          `${quoted}="from-quoted" # note`,
+          `${plain}=plain # note`,
+          `${quotedHash}="keep#hash"`,
+          `${bareHash}=keep#hash`,
+          `${single}='from-single' # note`,
+          `OTHER_SETTING=kept`,
+          "",
+        ].join("\n")
+      );
+      const expected = {
+        [exported]: "from-export",
+        [quoted]: "from-quoted",
+        [plain]: "plain",
+        [quotedHash]: "keep#hash",
+        [bareHash]: "keep#hash",
+        [single]: "from-single",
+        OTHER_SETTING: "kept",
+      };
+      expect(await readConfigEnv(root)).toEqual(expected);
+      expect(readConfigEnvSync(root)).toEqual(expected);
+    },
+    FS_TIMEOUT_MS
+  );
+
+  it(
+    "deletes an export-prefixed definition so the old secret does not return",
+    async () => {
+      const key = "ELIZA_TEST_CONFIG_ENV_EXPORT";
+      await fs.writeFile(
+        path.join(root, "config.env"),
+        `export ${key}=stale\n${key}=current\nOTHER_SETTING=keep\n`
+      );
+      await persistConfigEnv(key, "", { stateDir: root });
+      expect(await readConfigEnv(root)).toEqual({ OTHER_SETTING: "keep" });
+      expect(readConfigEnvSync(root)).toEqual({ OTHER_SETTING: "keep" });
+      const onDisk = await fs.readFile(path.join(root, "config.env"), "utf8");
+      expect(onDisk).toBe("OTHER_SETTING=keep\n");
+      expect(onDisk).not.toContain("stale");
+    },
+    FS_TIMEOUT_MS
+  );
+
+  it(
     "deletes every definition without reviving an older value",
     async () => {
       const key = "ELIZA_TEST_CONFIG_ENV_DUPLICATE";

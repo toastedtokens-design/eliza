@@ -43,6 +43,19 @@ const TMP_SUFFIX = ".tmp";
 const KEY_PATTERN = /^[A-Z][A-Z0-9_]*$/;
 
 /**
+ * One `KEY=value` assignment, including the dotenv `export` prefix.
+ * The key rule matches {@link KEY_PATTERN}; anything else is not an entry.
+ */
+function configEnvAssignment(line: string): { key: string; rawValue: string } | null {
+  const eq = line.indexOf("=");
+  if (eq <= 0) return null;
+  const keyMatch = /^(?:export\s+)?([A-Z][A-Z0-9_]*)$/.exec(line.slice(0, eq).trim());
+  const key = keyMatch?.[1];
+  if (!key || !KEY_PATTERN.test(key)) return null;
+  return { key, rawValue: line.slice(eq + 1) };
+}
+
+/**
  * Keys we refuse to write even though `config.env` is the designated
  * escape hatch for sensitive process-env-only material. These are
  * shell/runtime hijack vectors — they must never be set from the
@@ -111,17 +124,22 @@ function parseConfigEnv(contents: string): ParsedConfigEnv {
   }
   const index = new Map<string, number>();
   for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i] ?? "";
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq <= 0) continue;
-    const key = line.slice(0, eq).trim();
-    if (!KEY_PATTERN.test(key)) continue;
+    const assignment = configEnvAssignment(lines[i] ?? "");
+    if (!assignment) continue;
     // Last definition wins (standard dotenv behaviour).
-    index.set(key, i);
+    index.set(assignment.key, i);
   }
   return { lines, index };
+}
+
+function recordConfigEnv(parsed: ParsedConfigEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, idx] of parsed.index) {
+    const assignment = configEnvAssignment(parsed.lines[idx] ?? "");
+    if (!assignment) continue;
+    out[key] = decodeValue(assignment.rawValue);
+  }
+  return out;
 }
 
 function serialiseConfigEnv(parsed: ParsedConfigEnv): string {
@@ -210,16 +228,7 @@ export async function readConfigEnv(stateDir?: string): Promise<Record<string, s
   const filePath = resolveConfigEnvPath(stateDir);
   const raw = await readIfExists(filePath);
   if (raw === null) return {};
-  const parsed = parseConfigEnv(raw);
-  const out: Record<string, string> = {};
-  for (const [key, idx] of parsed.index) {
-    const line = parsed.lines[idx] ?? "";
-    const eq = line.indexOf("=");
-    if (eq < 0) continue;
-    const rawValue = line.slice(eq + 1);
-    out[key] = decodeValue(rawValue);
-  }
-  return out;
+  return recordConfigEnv(parseConfigEnv(raw));
 }
 
 /**
@@ -238,34 +247,58 @@ export function readConfigEnvSync(stateDir?: string): Record<string, string> {
     throw err;
   }
 
-  const parsed = parseConfigEnv(raw);
-  const out: Record<string, string> = {};
-  for (const [key, idx] of parsed.index) {
-    const line = parsed.lines[idx] ?? "";
-    const eq = line.indexOf("=");
-    if (eq < 0) continue;
-    out[key] = decodeValue(line.slice(eq + 1));
+  return recordConfigEnv(parseConfigEnv(raw));
+}
+
+function unescapeDoubleQuoted(inner: string): string {
+  // Decode once: an escaped backslash must not become a second escape.
+  return inner.replace(/\\([\\"nr])/g, (_match, escaped: string) => {
+    if (escaped === "n") return "\n";
+    if (escaped === "r") return "\r";
+    return escaped;
+  });
+}
+
+/** Quoted value and the index just after its closing quote. */
+function readQuotedValue(trimmed: string): { value: string; end: number } | null {
+  const quote = trimmed[0];
+  if (quote !== '"' && quote !== "'") return null;
+  let escaped = false;
+  for (let i = 1; i < trimmed.length; i += 1) {
+    const ch = trimmed[i] ?? "";
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === quote) {
+      const inner = trimmed.slice(1, i);
+      return {
+        value: quote === '"' ? unescapeDoubleQuoted(inner) : inner,
+        end: i + 1,
+      };
+    }
   }
-  return out;
+  return null;
 }
 
 function decodeValue(raw: string): string {
   const trimmed = raw.trim();
   if (trimmed.length === 0) return "";
-  const first = trimmed[0];
-  if ((first === '"' || first === "'") && trimmed.endsWith(first) && trimmed.length >= 2) {
-    const inner = trimmed.slice(1, -1);
-    if (first === '"') {
-      // Decode once: an escaped backslash must not become a second escape.
-      return inner.replace(/\\([\\"nr])/g, (_match, escaped: string) => {
-        if (escaped === "n") return "\n";
-        if (escaped === "r") return "\r";
-        return escaped;
-      });
-    }
-    return inner;
+  const quoted = readQuotedValue(trimmed);
+  if (quoted) {
+    const rest = trimmed.slice(quoted.end).trim();
+    // A closed quote may be followed by a dotenv comment. Other trailing
+    // text keeps the previous whole-value fallback.
+    if (rest.length === 0 || rest.startsWith("#")) return quoted.value;
   }
-  return trimmed;
+  // Unquoted comments start at whitespace + `#`. A bare `#` stays in the
+  // value so an unquoted hash is not truncated.
+  const commentAt = trimmed.search(/\s#/);
+  return (commentAt === -1 ? trimmed : trimmed.slice(0, commentAt)).trim();
 }
 
 /**
@@ -311,10 +344,7 @@ export async function persistConfigEnv(
       }
       // Removing only the winning definition would restore an older value
       // on the next read. Preserve unrelated entries and comments.
-      parsed.lines = parsed.lines.filter((line) => {
-        const eq = line.indexOf("=");
-        return eq <= 0 || line.slice(0, eq).trim() !== key;
-      });
+      parsed.lines = parsed.lines.filter((line) => configEnvAssignment(line)?.key !== key);
     } else {
       const encoded = `${key}=${encodeValue(value)}`;
       if (existingIdx === undefined) {
