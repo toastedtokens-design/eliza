@@ -407,15 +407,19 @@ export function computeNextCronRunAtMs(
 	return null;
 }
 
+// `Date.parse` reads `T`, `t`, and a single space as the same offsetless
+// wall time. A capital `T` alone left the other two spellings in the host
+// zone.
 const OFFSETLESS_ISO_DATE_TIME =
-	/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+	/^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 
 /**
  * Pin an ISO date-time that carries no `Z` or UTC offset to an absolute
- * instant by reading its wall-clock time in `timezone`. `Date.parse` reads
- * such a value in the host process zone, which is not the user's zone on a
- * cloud or container host. Values that already carry an offset, date-only
- * values and anything else are returned unchanged for `parseScheduledAtIso`.
+ * instant by reading its wall-clock time in `timezone`. The separator may be
+ * `T`, `t`, or one space. `Date.parse` reads each of those in the host
+ * process zone, which is not the user's zone on a cloud or container host.
+ * Values that already carry an offset, date-only values and anything else
+ * are returned unchanged for `parseScheduledAtIso`.
  */
 export function resolveScheduledAtIsoInTimeZone(
 	scheduledAtIso: string,
@@ -482,7 +486,13 @@ function resolveOnceTiming(
 	nowMs: number,
 ): TriggerTiming | null {
 	if (!trigger.scheduledAtIso) return null;
-	const scheduledAt = parseScheduledAtIso(trigger.scheduledAtIso);
+	// A once trigger stores the user's zone beside the clock time. Pin an
+	// offsetless value here so a host that did not pre-resolve it still fires
+	// at that wall time. A value that already has an offset is unchanged.
+	const scheduledAtIso = trigger.timezone
+		? resolveScheduledAtIsoInTimeZone(trigger.scheduledAtIso, trigger.timezone)
+		: trigger.scheduledAtIso;
+	const scheduledAt = parseScheduledAtIso(scheduledAtIso);
 	if (scheduledAt === null) return null;
 
 	const nextRunAtMs = Math.max(scheduledAt, nowMs);
